@@ -1,0 +1,68 @@
+import "dotenv/config";
+import express from "express";
+import cors from "cors";
+import helmet from "helmet";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import "./db.js";
+import { authenticate } from "./auth.js";
+import { ApiError } from "./utils.js";
+import { authRouter } from "./routes/auth.js";
+import { catalogsRouter } from "./routes/catalogs.js";
+import { studentsRouter } from "./routes/students.js";
+import { gradesRouter } from "./routes/grades.js";
+import { analyticsRouter } from "./routes/analytics.js";
+import { usersRouter } from "./routes/users.js";
+import { settingsRouter } from "./routes/settings.js";
+import { reportsRouter } from "./routes/reports.js";
+import { plansRouter } from "./routes/plans.js";
+import { portalRouter } from "./routes/portal.js";
+import { paymentsRouter } from "./routes/payments.js";
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const uploadsDir = process.env.UPLOADS_PATH
+  ? path.resolve(process.env.UPLOADS_PATH)
+  : path.join(root, "uploads");
+export const app = express();
+
+app.disable("x-powered-by");
+app.set("trust proxy", 1);
+app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
+app.use(cors({ origin: process.env.APP_ORIGIN ?? "http://localhost:4173" }));
+app.use(express.json({ limit: "1mb" }));
+app.use("/uploads", express.static(uploadsDir));
+
+app.get("/api/health", (_req, res) => res.json({ status: "ok", service: "Universidad IFOP API" }));
+app.use("/api/auth", authRouter);
+app.use("/api/catalogs", authenticate, catalogsRouter);
+app.use("/api/students", authenticate, studentsRouter);
+app.use("/api/grades", authenticate, gradesRouter);
+app.use("/api/analytics", authenticate, analyticsRouter);
+app.use("/api/users", authenticate, usersRouter);
+app.use("/api/settings", authenticate, settingsRouter);
+app.use("/api/reports", authenticate, reportsRouter);
+app.use("/api/plans", authenticate, plansRouter);
+app.use("/api/portal", authenticate, portalRouter);
+app.use("/api/payments", authenticate, paymentsRouter);
+
+if (process.env.NODE_ENV === "production") {
+  app.use(express.static(path.join(root, "dist")));
+  app.use((req, res, next) => {
+    if (req.method === "GET" && req.accepts("html")) {
+      return res.sendFile(path.join(root, "dist", "index.html"));
+    }
+    next();
+  });
+}
+
+app.use((_req, res) => res.status(404).json({ message: "Ruta no encontrada." }));
+app.use((error: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  const status = error instanceof ApiError ? error.status : error.code === "SQLITE_CONSTRAINT_UNIQUE" ? 409 : 500;
+  const message = error instanceof ApiError
+    ? error.message
+    : status === 409
+      ? "Ya existe un registro con esos datos."
+      : "Ocurrió un error inesperado.";
+  if (status >= 500) console.error(error);
+  res.status(status).json({ message, details: error instanceof ApiError ? error.details : undefined });
+});

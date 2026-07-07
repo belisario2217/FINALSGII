@@ -1,0 +1,15 @@
+{
+  "compilerOptions": {
+    "skipLibCheck": true,
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "allowSyntheticDefaultImports": true,
+    "esModuleInterop": true,
+    "strict": true,
+    "target": "ES2022",
+    "types": ["node"],
+    "outDir": "dist-server",
+    "noEmit": true
+  },
+  "include": ["server", "vite.config.ts"]
+}

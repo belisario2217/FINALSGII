@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: universidad-ifop
+    runtime: node
+    plan: starter
+    buildCommand: corepack enable && pnpm install --frozen-lockfile && pnpm build
+    startCommand: pnpm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: 22
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_PATH
+        value: /opt/render/project/src/storage/school.db
+      - key: UPLOADS_PATH
+        value: /opt/render/project/src/storage/uploads
+      - key: JWT_SECRET
+        generateValue: true
+    disk:
+      name: universidad-ifop-storage
+      mountPath: /opt/render/project/src/storage
+      sizeGB: 1
