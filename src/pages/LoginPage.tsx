@@ -32,16 +32,16 @@ export function LoginPage() {
       <section className="login-identity">
         <img src="/assets/campus-frontera.jpg" alt="" />
         <div>
-          <span className="identity-kicker">Instituto</span>
+          <span className="identity-kicker">Sistema Académico de Gestión Estudiantil</span>
           <h1>Universidad IFOP</h1>
-          <p>Gestión académica</p>
+          <p>Frontera, Centla</p>
         </div>
         <div className="identity-lines" aria-hidden="true"><i /><i /><i /></div>
       </section>
       <section className="login-panel">
         <form onSubmit={submit} className="login-form">
           <div className="login-heading">
-            <span>Acceso institucional</span>
+            <span> _ _ _ </span>
             <h2>Bienvenido de vuelta</h2>
             <p>Ingresa con tu cuenta asignada.</p>
           </div>
