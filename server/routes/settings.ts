@@ -97,7 +97,11 @@ settingsRouter.post(
         if (!Object.values(check).includes("ok")) {
           throw new ApiError(400, "La base SQLite esta danada.");
         }
-        const requiredTables = ["users", "students", "enrollments", "grades", "academic_plans"];
+        const requiredTables = [
+          "users", "students", "enrollments", "grades", "student_payments",
+          "academic_plans", "plan_subjects", "subjects", "groups", "shifts",
+          "school_cycles", "academic_periods", "programs"
+        ];
         const tables = candidate.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>;
         const available = new Set(tables.map((table) => table.name));
         if (requiredTables.some((table) => !available.has(table))) {
@@ -106,9 +110,18 @@ settingsRouter.post(
         const count = (table: string) => Number((candidate.prepare(`SELECT COUNT(*) AS total FROM ${table}`).get() as { total: number }).total);
         const summary = {
           students: count("students"),
+          enrollments: count("enrollments"),
           grades: count("grades"),
+          payments: count("student_payments"),
           users: count("users"),
-          plans: count("academic_plans")
+          plans: count("academic_plans"),
+          planSubjects: count("plan_subjects"),
+          subjects: count("subjects"),
+          groups: count("groups"),
+          shifts: count("shifts"),
+          cycles: count("school_cycles"),
+          periods: count("academic_periods"),
+          programs: count("programs")
         };
         candidate.close();
         if (fs.existsSync(restorePath)) fs.rmSync(restorePath);

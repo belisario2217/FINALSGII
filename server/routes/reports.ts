@@ -2,10 +2,10 @@ import { Router } from "express";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { requirePermission } from "../auth.js";
-import { all, get } from "../db.js";
+import { logActivity, requirePermission, type AuthenticatedRequest } from "../auth.js";
+import { all, get, run, transaction } from "../db.js";
 import { createPdf, pdfTable, sendWorkbook } from "../services/files.js";
-import { ApiError, asId } from "../utils.js";
+import { ApiError, asId, asNumber, cleanText, optionalText } from "../utils.js";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 export const reportsRouter = Router();
@@ -36,8 +36,149 @@ function drawGradeSection(doc: PDFKit.PDFDocument, title: string, records: any[]
     grade.subject_name,
     grade.period_name,
     grade.final_score == null ? "-" : Number(grade.final_score).toFixed(1),
-    grade.final_score == null ? "Por cursar" : grade.status === "passed" ? "Aprobada" : "Reprobada"
+    grade.final_score == null ? "Por cursar" : grade.status === "failed" ? "Reprobada" : "CURSADA"
   ]), [55, 185, 105, 80, 103]);
+}
+
+function defaultAcademicContext(groupId: number, cycleId: number | null) {
+  const group = get<any>(
+    `SELECT g.id, g.cycle_id, e.period_id
+     FROM groups g
+     LEFT JOIN enrollments e ON e.group_id = g.id AND e.is_active = 1
+     WHERE g.id = ? ORDER BY e.id DESC LIMIT 1`,
+    groupId
+  );
+  const effectiveCycleId = cycleId ?? group?.cycle_id ?? null;
+  const period = effectiveCycleId
+    ? get<{ id: number }>("SELECT id FROM academic_periods WHERE cycle_id = ? AND is_active = 1 ORDER BY sequence, id LIMIT 1", effectiveCycleId)
+    : null;
+  const fallbackPeriod = group?.period_id
+    ? get<{ id: number }>("SELECT id FROM academic_periods WHERE id = ?", group.period_id)
+    : null;
+  const scale = get<{ default_scale_id: number | null }>("SELECT default_scale_id FROM institution_settings WHERE id = 1");
+  const fallbackScale = scale?.default_scale_id
+    ? get<{ id: number }>("SELECT id FROM grading_scales WHERE id = ?", scale.default_scale_id)
+    : get<{ id: number }>("SELECT id FROM grading_scales WHERE is_active = 1 ORDER BY is_default DESC, id LIMIT 1");
+  const teacher = get<{ id: number }>("SELECT id FROM teachers WHERE is_active = 1 ORDER BY id LIMIT 1");
+  if (!teacher) throw new ApiError(400, "Agrega al menos un docente activo para crear materias en Calificaciones.");
+  if (!fallbackScale) throw new ApiError(400, "Configura una escala de calificacion activa.");
+  const effectivePeriod = period ?? fallbackPeriod;
+  if (!effectivePeriod) throw new ApiError(400, "Configura un periodo academico para el ciclo seleccionado.");
+  return { periodId: effectivePeriod.id, teacherId: teacher.id, scaleId: fallbackScale.id };
+}
+
+function ensureGradeAssignment(groupId: number, subjectId: number, cycleId: number | null) {
+  const context = defaultAcademicContext(groupId, cycleId);
+  const existing = get<{ id: number }>(
+    "SELECT id FROM subject_assignments WHERE subject_id = ? AND group_id = ? AND period_id = ?",
+    subjectId,
+    groupId,
+    context.periodId
+  );
+  if (existing) return existing.id;
+  const inserted = run(
+    `INSERT INTO subject_assignments(subject_id, group_id, teacher_id, period_id, grading_scale_id, evaluation_mode)
+     VALUES (?, ?, ?, ?, ?, 'partials')`,
+    subjectId,
+    groupId,
+    context.teacherId,
+    context.periodId,
+    context.scaleId
+  );
+  return Number(inserted.lastInsertRowid);
+}
+
+function gradeStatus(score: number | null, passingScore: number | null) {
+  if (score == null) return "pending";
+  return score >= Number(passingScore ?? 0) ? "passed" : "failed";
+}
+
+function syncCurricularGrade(userId: number, enrollmentId: number, assignmentId: number, score: number | null, comments: string | null) {
+  const assignment = get<{ passing_score: number; min_score: number; max_score: number }>(
+    `${assignmentSelectForSync("a.id = ?")}`,
+    assignmentId
+  );
+  if (!assignment) throw new ApiError(404, "No existe la asignacion academica.");
+  if (score != null && (score < assignment.min_score || score > assignment.max_score)) {
+    throw new ApiError(400, `El promedio debe estar entre ${assignment.min_score} y ${assignment.max_score}.`);
+  }
+  const status = gradeStatus(score, assignment.passing_score);
+  const current = get<{ id: number; final_score: number | null }>(
+    "SELECT id, final_score FROM grades WHERE enrollment_id = ? AND assignment_id = ?",
+    enrollmentId,
+    assignmentId
+  );
+  if (current) {
+    run(
+      `UPDATE grades SET final_score = ?, partial_1 = ?, partial_2 = ?, partial_3 = ?,
+       status = ?, comments = ?, updated_by = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+      score,
+      score,
+      score,
+      score,
+      status,
+      comments,
+      userId,
+      current.id
+    );
+    run(
+      "INSERT INTO grade_history(grade_id, old_score, new_score, reason, changed_by) VALUES (?, ?, ?, ?, ?)",
+      current.id,
+      current.final_score,
+      score,
+      "Sincronizacion desde trayectoria curricular",
+      userId
+    );
+    return current.id;
+  }
+  const inserted = run(
+    `INSERT INTO grades(enrollment_id, assignment_id, final_score, partial_1, partial_2, partial_3,
+     status, comments, created_by, updated_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    enrollmentId,
+    assignmentId,
+    score,
+    score,
+    score,
+    score,
+    status,
+    comments,
+    userId,
+    userId
+  );
+  run(
+    "INSERT INTO grade_history(grade_id, old_score, new_score, reason, changed_by) VALUES (?, NULL, ?, ?, ?)",
+    Number(inserted.lastInsertRowid),
+    score,
+    "Sincronizacion desde trayectoria curricular",
+    userId
+  );
+  return Number(inserted.lastInsertRowid);
+}
+
+function assignmentSelectForSync(where = "1 = 1") {
+  return `SELECT a.id, gs.min_score, gs.max_score, gs.passing_score
+    FROM subject_assignments a
+    JOIN grading_scales gs ON gs.id = a.grading_scale_id
+    WHERE ${where}`;
+}
+
+function deleteGradeAssignmentsForSubjects(groupId: number, subjectIds: number[]) {
+  if (!subjectIds.length) return 0;
+  const placeholders = subjectIds.map(() => "?").join(",");
+  const assignmentIds = all<{ id: number }>(
+    `SELECT id FROM subject_assignments WHERE group_id = ? AND subject_id IN (${placeholders})`,
+    groupId,
+    ...subjectIds
+  ).map((row) => row.id);
+  if (!assignmentIds.length) return 0;
+  const assignmentPlaceholders = assignmentIds.map(() => "?").join(",");
+  run(`DELETE FROM grade_history WHERE grade_id IN (SELECT id FROM grades WHERE assignment_id IN (${assignmentPlaceholders}))`, ...assignmentIds);
+  run(`DELETE FROM grade_components WHERE grade_id IN (SELECT id FROM grades WHERE assignment_id IN (${assignmentPlaceholders}))`, ...assignmentIds);
+  run(`DELETE FROM grades WHERE assignment_id IN (${assignmentPlaceholders})`, ...assignmentIds);
+  run(`DELETE FROM assignment_criteria WHERE assignment_id IN (${assignmentPlaceholders})`, ...assignmentIds);
+  run(`DELETE FROM subject_assignments WHERE id IN (${assignmentPlaceholders})`, ...assignmentIds);
+  return assignmentIds.length;
 }
 
 function drawReportCard(doc: PDFKit.PDFDocument, studentId: number, periodId?: number) {
@@ -66,28 +207,54 @@ function drawReportCard(doc: PDFKit.PDFDocument, studentId: number, periodId?: n
   }
 
   const grades = all<any>(
-    `WITH base_subjects AS (
-       SELECT ps.subject_id, ps.recommended_period AS course_cycle, ps.credits
+    `WITH explicit_subjects AS (
+       SELECT LOWER(TRIM(s.name)) AS subject_key, ss.subject_id, ss.semester_number AS course_cycle, ss.credits, ss.status AS explicit_status,
+        ss.final_score AS explicit_score, ss.notes AS explicit_notes
+       FROM student_subjects ss
+       JOIN subjects s ON s.id = ss.subject_id
+       WHERE ss.student_id = ?
+     ),
+     base_raw AS (
+       SELECT es.subject_key, es.subject_id, es.course_cycle, es.credits, es.explicit_status, es.explicit_score, es.explicit_notes
+       FROM explicit_subjects es
+       UNION
+       SELECT LOWER(TRIM(s.name)) AS subject_key, ps.subject_id, ps.recommended_period AS course_cycle, ps.credits,
+        NULL AS explicit_status, NULL AS explicit_score, NULL AS explicit_notes
        FROM plan_subjects ps
+       JOIN subjects s ON s.id = ps.subject_id
        WHERE ps.plan_id = (
          SELECT e.plan_id FROM enrollments e
          WHERE e.student_id = ? AND e.is_active = 1
          ORDER BY e.id DESC LIMIT 1
        )
+       AND NOT EXISTS (SELECT 1 FROM explicit_subjects es WHERE es.subject_key = LOWER(TRIM(s.name)))
        UNION
-       SELECT s.id AS subject_id, NULL AS course_cycle, s.credits
+       SELECT LOWER(TRIM(s.name)) AS subject_key, s.id AS subject_id, NULL AS course_cycle, s.credits,
+        NULL AS explicit_status, NULL AS explicit_score, NULL AS explicit_notes
        FROM grades gr
        JOIN enrollments e ON e.id = gr.enrollment_id
        JOIN subject_assignments a ON a.id = gr.assignment_id
        JOIN subjects s ON s.id = a.subject_id
        WHERE e.student_id = ?
+       AND NOT EXISTS (SELECT 1 FROM explicit_subjects)
        AND NOT EXISTS (
          SELECT 1 FROM plan_subjects ps
          WHERE ps.plan_id = e.plan_id AND ps.subject_id = s.id
        )
+       AND NOT EXISTS (SELECT 1 FROM explicit_subjects es WHERE es.subject_key = LOWER(TRIM(s.name)))
+     ),
+     base_subjects AS (
+       SELECT subject_key, MIN(subject_id) AS subject_id,
+        COALESCE(MIN(CASE WHEN explicit_status IS NOT NULL THEN course_cycle END), MIN(course_cycle)) AS course_cycle,
+        MAX(credits) AS credits,
+        MAX(explicit_status) AS explicit_status,
+        MAX(explicit_score) AS explicit_score,
+        MAX(explicit_notes) AS explicit_notes
+       FROM base_raw
+       GROUP BY subject_key
      ),
      grade_rows AS (
-       SELECT s.id AS subject_id, ap.sequence AS period_sequence,
+       SELECT LOWER(TRIM(s.name)) AS subject_key, s.id AS subject_id, ap.sequence AS period_sequence,
         CASE WHEN a.grade_entry_locked = 1 THEN 'ORDINARIO' ELSE ap.name END AS period_name,
         gr.final_score, gr.comments, gs.passing_score
        FROM grades gr
@@ -101,23 +268,27 @@ function drawReportCard(doc: PDFKit.PDFDocument, studentId: number, periodId?: n
      SELECT s.name AS subject_name,
       COALESCE(bs.course_cycle, MIN(gr.period_sequence), 999) AS course_cycle,
       CASE
-        WHEN COUNT(gr.final_score) = 0 THEN 'Pendiente'
+       WHEN COUNT(gr.final_score) = 0 THEN 'Pendiente'
+        WHEN MAX(bs.explicit_status) = 'completed' THEN 'ORDINARIO'
         WHEN SUM(CASE WHEN gr.period_name = 'ORDINARIO' THEN 1 ELSE 0 END) > 0 THEN 'ORDINARIO'
         ELSE COALESCE(MAX(gr.period_name), 'Pendiente')
       END AS period_name,
-      CASE WHEN COUNT(gr.final_score) = 0 THEN NULL ELSE ROUND(AVG(gr.final_score), 1) END AS final_score,
+      COALESCE(MAX(bs.explicit_score), CASE WHEN COUNT(gr.final_score) = 0 THEN NULL ELSE ROUND(AVG(gr.final_score), 1) END) AS final_score,
       CASE
-        WHEN COUNT(gr.final_score) = 0 THEN 'pending'
-        WHEN AVG(gr.final_score) >= COALESCE(MAX(gr.passing_score), 0) THEN 'passed'
+        WHEN MAX(bs.explicit_status) = 'completed' THEN 'passed'
+        WHEN MAX(bs.explicit_status) IN ('pending', 'in_progress') AND MAX(bs.explicit_score) IS NULL AND COUNT(gr.final_score) = 0 THEN 'pending'
+        WHEN COALESCE(MAX(bs.explicit_score), AVG(gr.final_score)) IS NULL THEN 'pending'
+        WHEN COALESCE(MAX(bs.explicit_score), AVG(gr.final_score)) >= COALESCE(MAX(gr.passing_score), 0) THEN 'passed'
         ELSE 'failed'
       END AS status,
-      GROUP_CONCAT(DISTINCT gr.comments) AS comments,
+      TRIM(COALESCE(MAX(bs.explicit_notes), '') || CASE WHEN GROUP_CONCAT(DISTINCT gr.comments) IS NULL THEN '' ELSE ' ' || GROUP_CONCAT(DISTINCT gr.comments) END) AS comments,
       COALESCE(MAX(gr.passing_score), 0) AS passing_score
      FROM base_subjects bs
      JOIN subjects s ON s.id = bs.subject_id
-     LEFT JOIN grade_rows gr ON gr.subject_id = bs.subject_id
-     GROUP BY bs.subject_id, s.name, bs.course_cycle
+     LEFT JOIN grade_rows gr ON gr.subject_key = bs.subject_key
+     GROUP BY bs.subject_key, s.name, bs.course_cycle
      ORDER BY COALESCE(bs.course_cycle, MIN(gr.period_sequence), 999), s.name`,
+    studentId,
     ...params
   );
 
@@ -164,12 +335,13 @@ function drawReportCard(doc: PDFKit.PDFDocument, studentId: number, periodId?: n
   if (comments) {
     doc.moveDown().fillColor("#486581").font("Helvetica").fontSize(9).text(`Observaciones: ${comments}`);
   }
-  if (doc.y > 620) doc.addPage();
-  const signatureY = 620;
-  doc.moveTo(80, signatureY).lineTo(260, signatureY).strokeColor("#9fb3c8").stroke();
-  doc.moveTo(350, signatureY).lineTo(530, signatureY).stroke();
-  doc.fillColor("#627d98").fontSize(8).text(settings.director_name || "Responsable academico", 80, signatureY + 6, { width: 180, align: "center" });
-  doc.text("Firma del padre, madre o tutor", 350, signatureY + 6, { width: 180, align: "center" });
+  const signatureY = Math.max(doc.y + 28, 620);
+  if (signatureY > 690) doc.addPage();
+  const finalSignatureY = signatureY > 690 ? 96 : signatureY;
+  doc.moveTo(80, finalSignatureY).lineTo(260, finalSignatureY).strokeColor("#9fb3c8").stroke();
+  doc.moveTo(350, finalSignatureY).lineTo(530, finalSignatureY).stroke();
+  doc.fillColor("#627d98").fontSize(8).text(settings.director_name || "Responsable academico", 80, finalSignatureY + 6, { width: 180, align: "center" });
+  doc.text("Firma del padre, madre o tutor", 350, finalSignatureY + 6, { width: 180, align: "center" });
   doc.fontSize(7).text(settings.footer_text || "", 42, 735, { width: 528, align: "center" });
   doc.text(`Fecha de emision: ${new Date().toLocaleDateString("es-MX")}`, 42, 747, { width: 528, align: "center" });
 }
@@ -193,6 +365,237 @@ reportsRouter.get("/report-card.pdf", requirePermission("reports.generate"), (re
     drawReportCard(doc, id, periodId);
   });
   doc.end();
+});
+
+function curricularWhere(req: any) {
+  const clauses = ["st.is_active = 1"];
+  const params: number[] = [];
+  if (req.query.groupId) {
+    clauses.push("e.group_id = ?");
+    params.push(asId(req.query.groupId, "Grupo"));
+  }
+  if (req.query.studentId) {
+    clauses.push("ss.student_id = ?");
+    params.push(asId(req.query.studentId, "Alumno"));
+  }
+  if (req.query.semester) {
+    clauses.push("ss.semester_number = ?");
+    params.push(Math.max(1, Math.trunc(asNumber(req.query.semester, "Semestre"))));
+  }
+  return { clauses, params };
+}
+
+reportsRouter.get("/curricular-subjects", requirePermission("reports.view"), (req, res) => {
+  const { clauses, params } = curricularWhere(req);
+  res.json(all<any>(
+    `SELECT ss.id, ss.student_id, ss.enrollment_id, ss.plan_id, ss.subject_id, ss.school_cycle_id,
+     ss.semester_number, ss.subject_type, ss.credits, ss.status, ss.final_score, ss.notes,
+     st.student_number, TRIM(st.first_name || ' ' || st.last_name || ' ' || COALESCE(st.second_last_name, '')) AS student_name,
+     s.code AS subject_code, s.name AS subject_name, g.name AS group_name, sc.name AS cycle_name
+     FROM student_subjects ss
+     JOIN students st ON st.id = ss.student_id
+     JOIN subjects s ON s.id = ss.subject_id
+     LEFT JOIN enrollments e ON e.id = ss.enrollment_id
+     LEFT JOIN groups g ON g.id = e.group_id
+     LEFT JOIN school_cycles sc ON sc.id = ss.school_cycle_id
+     WHERE ${clauses.join(" AND ")}
+     ORDER BY ss.semester_number, st.last_name, st.first_name, s.name`,
+    ...params
+  ));
+});
+
+reportsRouter.post("/curricular-subjects/bulk", requirePermission("reports.generate"), (req: AuthenticatedRequest, res) => {
+  const groupId = asId(req.body.groupId, "Grupo");
+  const semester = Math.max(1, Math.trunc(asNumber(req.body.semester || 1, "Semestre")));
+  const planId = req.body.planId ? asId(req.body.planId, "Plan") : null;
+  const cycleId = req.body.cycleId ? asId(req.body.cycleId, "Ciclo escolar") : null;
+  const initialStatus = ["pending", "in_progress", "completed"].includes(String(req.body.status))
+    ? String(req.body.status)
+    : "in_progress";
+  const subjectIds = Array.isArray(req.body.subjectIds)
+    ? req.body.subjectIds.map((id: unknown) => asId(id, "Materia"))
+    : [];
+  const enrollments = all<any>(
+    `SELECT e.id, e.student_id, e.plan_id, e.cycle_id
+     FROM enrollments e JOIN students st ON st.id = e.student_id
+     WHERE e.group_id = ? AND e.is_active = 1 AND st.is_active = 1`,
+    groupId
+  );
+  if (!enrollments.length) throw new ApiError(404, "El grupo no tiene alumnos activos.");
+
+  let inserted = 0;
+  transaction(() => {
+    enrollments.forEach((enrollment) => {
+      const effectivePlanId = planId ?? enrollment.plan_id;
+      const subjects = subjectIds.length
+        ? all<any>(
+          `SELECT s.id AS subject_id, COALESCE(ps.subject_type, 'mandatory') AS subject_type,
+           COALESCE(ps.credits, NULLIF(s.credits, 0), 1) AS credits
+           FROM subjects s
+           LEFT JOIN plan_subjects ps ON ps.subject_id = s.id AND (? IS NULL OR ps.plan_id = ?)
+           WHERE s.id IN (${subjectIds.map(() => "?").join(",")})`,
+          effectivePlanId, effectivePlanId, ...subjectIds
+        )
+        : all<any>(
+          `SELECT ps.subject_id, ps.subject_type, ps.credits
+           FROM plan_subjects ps
+           WHERE ps.plan_id = ? AND ps.recommended_period = ?
+           ORDER BY ps.id`,
+          effectivePlanId, semester
+        );
+      subjects.forEach((subject) => {
+        ensureGradeAssignment(groupId, subject.subject_id, cycleId ?? enrollment.cycle_id);
+        const result = run(
+          `INSERT INTO student_subjects(student_id, enrollment_id, plan_id, subject_id, school_cycle_id,
+           semester_number, subject_type, credits, status)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(student_id, subject_id, school_cycle_id, semester_number)
+           DO UPDATE SET enrollment_id = excluded.enrollment_id, plan_id = excluded.plan_id,
+             subject_type = excluded.subject_type, credits = excluded.credits, updated_at = CURRENT_TIMESTAMP`,
+          enrollment.student_id,
+          enrollment.id,
+          effectivePlanId,
+          subject.subject_id,
+          cycleId ?? enrollment.cycle_id,
+          semester,
+          subject.subject_type,
+          subject.credits,
+          initialStatus
+        );
+        inserted += Number(result.changes);
+      });
+    });
+  });
+  logActivity(req, "assign-curricular-subjects", "student_subjects", groupId, { semester, planId, cycleId, subjectCount: subjectIds.length, rows: inserted });
+  res.status(201).json({ count: inserted });
+});
+
+reportsRouter.post("/curricular-subjects/delete-many", requirePermission("reports.generate"), (req: AuthenticatedRequest, res) => {
+  const ids = Array.isArray(req.body.ids) ? req.body.ids.map((id: unknown) => asId(id, "Materia del alumno")) : [];
+  if (!ids.length) throw new ApiError(400, "Selecciona al menos una materia para borrar.");
+  const placeholders = ids.map(() => "?").join(",");
+  const existing = all<any>(
+    `SELECT ss.*, e.group_id FROM student_subjects ss
+     LEFT JOIN enrollments e ON e.id = ss.enrollment_id
+     WHERE ss.id IN (${placeholders})`,
+    ...ids
+  );
+  transaction(() => {
+    const byGroup = existing.reduce<Record<number, number[]>>((grouped, row) => {
+      if (row.group_id) (grouped[Number(row.group_id)] ??= []).push(Number(row.subject_id));
+      return grouped;
+    }, {});
+    Object.entries(byGroup).forEach(([groupId, subjectIds]) => {
+      deleteGradeAssignmentsForSubjects(Number(groupId), [...new Set(subjectIds)]);
+    });
+    run(`DELETE FROM student_subjects WHERE id IN (${placeholders})`, ...ids);
+  });
+  logActivity(req, "bulk-delete-curricular-subjects", "student_subjects", undefined, { ids, count: existing.length });
+  res.json({ count: existing.length });
+});
+
+reportsRouter.post("/curricular-subjects/clear-group", requirePermission("reports.generate"), (req: AuthenticatedRequest, res) => {
+  const groupId = asId(req.body.groupId, "Grupo");
+  const confirmation = cleanText(req.body.confirmation, 30).toUpperCase();
+  if (confirmation !== "LIMPIAR") throw new ApiError(400, "Confirma escribiendo LIMPIAR.");
+  const rows = all<any>(
+    `SELECT ss.id, ss.subject_id FROM student_subjects ss
+     JOIN enrollments e ON e.id = ss.enrollment_id
+     WHERE e.group_id = ?`,
+    groupId
+  );
+  const subjectIds = [...new Set(rows.map((row: any) => Number(row.subject_id)).filter(Boolean))];
+  transaction(() => {
+    deleteGradeAssignmentsForSubjects(groupId, subjectIds);
+    run(
+      `DELETE FROM student_subjects
+       WHERE id IN (
+         SELECT ss.id FROM student_subjects ss
+         JOIN enrollments e ON e.id = ss.enrollment_id
+         WHERE e.group_id = ?
+       )`,
+      groupId
+    );
+  });
+  logActivity(req, "clear-curricular-group", "student_subjects", groupId, { count: rows.length });
+  res.json({ count: rows.length });
+});
+
+reportsRouter.patch("/curricular-subjects/:id", requirePermission("reports.generate"), (req: AuthenticatedRequest, res) => {
+  const id = asId(req.params.id, "Registro curricular");
+  const current = get<any>("SELECT * FROM student_subjects WHERE id = ?", id);
+  if (!current) throw new ApiError(404, "No se encontro la materia del alumno.");
+  const enrollment = get<{ id: number; group_id: number; cycle_id: number }>(
+    "SELECT id, group_id, cycle_id FROM enrollments WHERE id = ?",
+    current.enrollment_id
+  );
+  if (!enrollment) throw new ApiError(404, "No se encontro la inscripcion vinculada.");
+  const subjectId = req.body.subjectId ? asId(req.body.subjectId, "Materia") : current.subject_id;
+  const semester = req.body.semester ? Math.max(1, Math.trunc(asNumber(req.body.semester, "Semestre"))) : current.semester_number;
+  const cycleId = req.body.cycleId === "" || req.body.cycleId == null ? current.school_cycle_id : asId(req.body.cycleId, "Ciclo escolar");
+  const status = ["pending", "in_progress", "completed"].includes(String(req.body.status)) ? String(req.body.status) : current.status;
+  const finalScore = req.body.finalScore === "" || req.body.finalScore == null ? null : asNumber(req.body.finalScore, "Promedio");
+  const credits = req.body.credits === "" || req.body.credits == null ? current.credits : Math.max(0, asNumber(req.body.credits, "Creditos"));
+  const subjectType = req.body.subjectType === "elective" ? "elective" : req.body.subjectType === "mandatory" ? "mandatory" : current.subject_type;
+  const notes = optionalText(req.body.notes, 500);
+  transaction(() => {
+    run(
+      `UPDATE student_subjects SET subject_id = ?, school_cycle_id = ?, semester_number = ?, subject_type = ?,
+       credits = ?, status = ?, final_score = ?, notes = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+      subjectId,
+      cycleId,
+      semester,
+      subjectType,
+      credits,
+      status,
+      finalScore,
+      notes,
+      id
+    );
+    const assignmentId = ensureGradeAssignment(enrollment.group_id, subjectId, cycleId ?? enrollment.cycle_id);
+    syncCurricularGrade(req.user!.id, enrollment.id, assignmentId, finalScore, notes);
+  });
+  const updated = get("SELECT * FROM student_subjects WHERE id = ?", id);
+  logActivity(req, "update-curricular-subject", "student_subjects", id, updated);
+  res.json(updated);
+});
+
+reportsRouter.patch("/curricular-subjects/:id", requirePermission("reports.generate"), (req: AuthenticatedRequest, res) => {
+  const id = asId(req.params.id, "Registro curricular");
+  const current = get<any>("SELECT * FROM student_subjects WHERE id = ?", id);
+  if (!current) throw new ApiError(404, "No se encontrÃ³ la materia del alumno.");
+  const subjectId = req.body.subjectId ? asId(req.body.subjectId, "Materia") : current.subject_id;
+  const semester = req.body.semester ? Math.max(1, Math.trunc(asNumber(req.body.semester, "Semestre"))) : current.semester_number;
+  const cycleId = req.body.cycleId === "" || req.body.cycleId == null ? current.school_cycle_id : asId(req.body.cycleId, "Ciclo escolar");
+  const status = ["pending", "in_progress", "completed"].includes(String(req.body.status)) ? String(req.body.status) : current.status;
+  const finalScore = req.body.finalScore === "" || req.body.finalScore == null ? null : asNumber(req.body.finalScore, "Promedio");
+  const credits = req.body.credits === "" || req.body.credits == null ? current.credits : Math.max(0, asNumber(req.body.credits, "CrÃ©ditos"));
+  const subjectType = req.body.subjectType === "elective" ? "elective" : req.body.subjectType === "mandatory" ? "mandatory" : current.subject_type;
+  run(
+    `UPDATE student_subjects SET subject_id = ?, school_cycle_id = ?, semester_number = ?, subject_type = ?,
+     credits = ?, status = ?, final_score = ?, notes = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+    subjectId,
+    cycleId,
+    semester,
+    subjectType,
+    credits,
+    status,
+    finalScore,
+    optionalText(req.body.notes, 500),
+    id
+  );
+  const updated = get("SELECT * FROM student_subjects WHERE id = ?", id);
+  logActivity(req, "update-curricular-subject", "student_subjects", id, updated);
+  res.json(updated);
+});
+
+reportsRouter.delete("/curricular-subjects/:id", requirePermission("reports.generate"), (req: AuthenticatedRequest, res) => {
+  const id = asId(req.params.id, "Registro curricular");
+  const current = get("SELECT * FROM student_subjects WHERE id = ?", id);
+  if (!current) throw new ApiError(404, "La materia del alumno ya no existe.");
+  run("DELETE FROM student_subjects WHERE id = ?", id);
+  logActivity(req, "delete-curricular-subject", "student_subjects", id, current);
+  res.status(204).end();
 });
 
 const reportDefinitions = {
