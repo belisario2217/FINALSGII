@@ -484,8 +484,23 @@ tbody tr:last-child td { border-bottom: 0; }
 .partial-empty, .muted-cell { color: #9fb3c8; }
 .grade-pass-text { color: var(--green); }
 .grade-fail-text { color: var(--red); }
+.curricular-admin { background: white; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+.curricular-admin .section-heading { padding: 16px 18px 0; }
+.curricular-controls { display: grid; grid-template-columns: minmax(160px, 1fr) minmax(180px, 1.2fr) minmax(210px, 1.4fr) 95px minmax(145px, .9fr) auto; gap: 10px; align-items: end; padding: 12px 18px; border-bottom: 1px solid var(--line); }
+.semester-subject-strip { min-height: 40px; display: flex; align-items: center; gap: 7px; flex-wrap: wrap; padding: 8px 18px; background: #f7fafc; border-bottom: 1px solid var(--line); }
+.semester-subject-strip span { min-height: 22px; display: inline-flex; align-items: center; padding: 0 7px; color: #375a6d; background: #e4f0f4; border: 1px solid #c8dce5; border-radius: 3px; font-size: 9px; font-weight: 700; }
+.semester-subject-strip small { color: var(--muted); font-size: 10px; }
+.bulk-toolbar { display: flex; align-items: center; justify-content: flex-end; gap: 8px; padding: 0 18px 12px; border-bottom: 1px solid var(--line); }
+.curricular-table { max-height: 390px; }
+.curricular-table select, .curricular-table input { width: 100%; min-height: 32px; padding: 5px 7px; font-size: 10px; }
+.compact-input { max-width: 82px; }
+.empty-row { min-height: 90px; display: grid; place-items: center; color: var(--muted); font-size: 11px; }
 
-.payments-page .toolbar-actions .field { width: 150px; }
+.payments-page .toolbar { align-items: flex-end; overflow: hidden; }
+.payments-page .toolbar-primary { flex: 1 1 280px; }
+.payments-page .toolbar-actions { flex: 2 1 620px; flex-wrap: wrap; justify-content: flex-end; min-width: 0; }
+.payments-page .toolbar-actions .field { flex: 1 1 136px; width: auto; max-width: 170px; }
+.payments-page .toolbar-actions .button { flex: 0 1 auto; max-width: 100%; }
 .payment-search-results { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 10px; }
 .payment-search-results > button { min-height: 70px; display: grid; grid-template-columns: 36px minmax(0, 1fr) auto; align-items: center; gap: 10px; padding: 12px; color: #486581; background: white; border: 1px solid var(--line); border-radius: 6px; text-align: left; }
 .payment-search-results > button:hover, .payment-search-results > button.active { border-color: var(--blue); box-shadow: inset 3px 0 var(--blue); }
