@@ -1,4 +1,4 @@
-import { Router } from "express";
+﻿import { Router } from "express";
 import crypto from "node:crypto";
 import { logActivity, requirePermission, type AuthenticatedRequest } from "../auth.js";
 import { all, get, run, transaction } from "../db.js";
@@ -31,6 +31,7 @@ type PaymentImportRow = {
   studentNumber: string;
   studentName: string;
   folio: string;
+  originalFolio: string;
   amount: number;
   paidAt: string;
   paymentMethod: string | null;
@@ -72,8 +73,28 @@ function value(row: TabularRow, ...aliases: string[]) {
   return "";
 }
 
+function receiptKey(value: unknown) {
+  const text = cleanText(value, 80);
+  return text.replace(/^0+/, "") || text;
+}
+
 function parseAmount(value: unknown) {
   const text = cleanText(value, 40).replace(/\$/g, "").replace(/,/g, "").trim();
+  if (/^=\s*\d+(?:\.\d+)?(?:\s*[+*]\s*\d+(?:\.\d+)?)+\s*$/.test(text)) {
+    let total: number | null = null;
+    let operator = "+";
+    for (const token of text.slice(1).match(/\d+(?:\.\d+)?|[+*]/g) ?? []) {
+      if (token === "+" || token === "*") {
+        operator = token;
+        continue;
+      }
+      const number = Number(token);
+      if (total === null) total = number;
+      else if (operator === "+") total += number;
+      else total *= number;
+    }
+    return total ?? NaN;
+  }
   return Number(text);
 }
 
@@ -82,7 +103,13 @@ function money(value: unknown) {
 }
 
 function validDate(value: unknown, field: string) {
-  const text = cleanText(value, 40);
+  const corrections: Record<string, string> = {
+    "16/05726": "16/05/2026",
+    "01/06726": "01/06/2026",
+    "01/03726": "01/03/2026",
+    "04//04/26": "04/04/2026"
+  };
+  const text = corrections[cleanText(value, 40)] ?? cleanText(value, 40);
   if (/^\d{4}-\d{2}-\d{2}$/.test(text) && !Number.isNaN(new Date(`${text}T00:00:00`).getTime())) {
     return text;
   }
@@ -90,7 +117,8 @@ function validDate(value: unknown, field: string) {
   if (slash) {
     const first = Number(slash[1]);
     const second = Number(slash[2]);
-    const year = Number(slash[3].length === 2 ? `20${slash[3]}` : slash[3]);
+    let year = Number(slash[3].length === 2 ? `20${slash[3]}` : slash[3]);
+    if (year < 2020) year += 10;
     const day = first > 12 ? first : second;
     const month = first > 12 ? second : first;
     const normalized = `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
@@ -104,6 +132,34 @@ function validDate(value: unknown, field: string) {
     }
   }
   throw new ApiError(400, `${field} no es una fecha valida.`);
+}
+
+function uniqueImportFolio(studentNumber: string, originalFolio: string, paidAt: string, row: number) {
+  return `PAG-${studentNumber}-${originalFolio || paidAt.replaceAll("-", "")}-${row}`;
+}
+
+function existingPaymentForImport(item: PaymentImportRow) {
+  const byGeneratedFolio = get<{ id: number }>("SELECT id FROM student_payments WHERE folio = ?", item.folio);
+  if (byGeneratedFolio) return byGeneratedFolio.id;
+  const originalKey = receiptKey(item.originalFolio);
+  if (originalKey) {
+    const byOriginalReceipt = all<{ id: number; notes: string | null }>(
+      "SELECT id, notes FROM student_payments WHERE student_id = ? AND amount = ?",
+      item.studentId,
+      item.amount
+    ).find((payment) => receiptKey(payment.notes) === originalKey);
+    if (byOriginalReceipt) return byOriginalReceipt.id;
+  }
+  const bySamePayment = get<{ id: number }>(
+    `SELECT id FROM student_payments
+     WHERE student_id = ? AND paid_at = ? AND amount = ? AND UPPER(TRIM(concept)) = UPPER(TRIM(?))
+     ORDER BY id LIMIT 1`,
+    item.studentId,
+    item.paidAt,
+    item.amount,
+    item.concept
+  );
+  return bySamePayment?.id ?? null;
 }
 
 function validMonth(value: unknown) {
@@ -328,8 +384,8 @@ paymentsRouter.post("/import/preview", requirePermission("payments.manage"), upl
   const errors: Array<{ row: number; message: string }> = [];
   rows.forEach((source, index) => {
     const rowNumber = index + 2;
-    const studentNumber = value(source, "Matricula", "Matrícula");
-    const folioInput = value(source, "Folio", "Recibo", "Referencia").toUpperCase();
+    const studentNumber = value(source, "Matricula", "MatrÃ­cula");
+    const originalFolio = value(source, "Folio", "Recibo", "Referencia").toUpperCase();
     const paidAtInput = value(source, "Fecha de pago", "Fecha");
     const amountInput = value(source, "Monto", "Importe");
     if (!studentNumber || !paidAtInput || amountInput === "") {
@@ -374,21 +430,26 @@ paymentsRouter.post("/import/preview", requirePermission("payments.manage"), upl
       errors.push({ row: rowNumber, message: "No se encontro alumno activo con esa matricula." });
       return;
     }
-    const folio = folioInput || `IMP-${studentNumber}-${paidAt.replaceAll("-", "")}-${rowNumber}`;
-    const existing = get<{ id: number }>("SELECT id FROM student_payments WHERE folio = ?", folio);
-    valid.push({
+    const folio = uniqueImportFolio(studentNumber, originalFolio, paidAt, rowNumber);
+    const paymentMethod = optionalText(value(source, "Metodo", "MÃ©todo", "Método", "Forma de pago"), 80);
+    const concept = cleanText(value(source, "Concepto") || "Colegiatura", 120) || "Colegiatura";
+    const notes = optionalText(value(source, "Notas", "Observaciones"), 800) ?? optionalText(originalFolio, 80);
+    const draft: PaymentImportRow = {
       row: rowNumber,
       studentId: account.studentId,
       studentNumber,
       studentName: account.student_name,
       folio,
+      originalFolio,
       amount,
       paidAt,
-      paymentMethod: optionalText(value(source, "Metodo", "Método"), 80),
-      concept: cleanText(value(source, "Concepto") || "Colegiatura", 120) || "Colegiatura",
-      notes: optionalText(value(source, "Notas", "Observaciones"), 800),
-      existingPaymentId: existing?.id ?? null
-    });
+      paymentMethod,
+      concept,
+      notes,
+      existingPaymentId: null
+    };
+    draft.existingPaymentId = existingPaymentForImport(draft);
+    valid.push(draft);
   });
   const previewId = crypto.randomUUID();
   paymentPreviews.set(previewId, { createdAt: Date.now(), valid, errors });
@@ -416,24 +477,26 @@ paymentsRouter.post("/import/apply", requirePermission("payments.manage"), (req:
         ignored++;
         return;
       }
-      if (item.existingPaymentId) {
+      const existingPaymentId = item.existingPaymentId ?? existingPaymentForImport(item);
+      if (existingPaymentId) {
         if (!updateExisting) {
           ignored++;
           return;
         }
         run(
-          `UPDATE student_payments SET student_id = ?, enrollment_id = ?, plan_id = ?, amount = ?, paid_at = ?,
+          `UPDATE student_payments SET student_id = ?, enrollment_id = ?, plan_id = ?, folio = ?, amount = ?, paid_at = ?,
            payment_method = ?, concept = ?, notes = ?, updated_by = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
           item.studentId,
           account.enrollmentId,
           account.planId,
+          item.folio,
           item.amount,
           item.paidAt,
           item.paymentMethod,
           item.concept,
           item.notes,
           req.user!.id,
-          item.existingPaymentId
+          existingPaymentId
         );
         updated++;
         return;
@@ -618,3 +681,4 @@ paymentsRouter.delete("/:id", requirePermission("payments.manage"), (req: Authen
   logActivity(req, "delete", "student_payments", id, payment);
   res.status(204).end();
 });
+
