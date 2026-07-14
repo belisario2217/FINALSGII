@@ -4,7 +4,7 @@ import { api, download, openDocument } from "../lib/api";
 import { useAuth } from "../lib/auth";
 import { useToast } from "../components/Toast";
 import { Modal } from "../components/Modal";
-import { Button, EmptyState, Field, Select, StatusBadge } from "../components/Ui";
+import { Button, EmptyState, Field, Select } from "../components/Ui";
 
 type StudentResult = {
   id: number;
@@ -61,14 +61,6 @@ type AccountData = {
       pendingInstallments: number;
     };
     payments: Payment[];
-    schedule: Array<{
-      period: number;
-      dueDate: string | null;
-      expectedAmount: number;
-      paidAmount: number;
-      pendingAmount: number;
-      status: "paid" | "partial" | "pending" | "not_due";
-    }>;
   };
 };
 
