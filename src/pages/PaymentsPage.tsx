@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { Banknote, CalendarDays, Download, FileSpreadsheet, Pencil, Plus, ReceiptText, Search, Trash2, Upload, WalletCards } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { Banknote, CalendarDays, Download, FileSpreadsheet, Pencil, Plus, ReceiptText, Search, Trash2, WalletCards } from "lucide-react";
 import { api, download, openDocument } from "../lib/api";
 import { useAuth } from "../lib/auth";
 import { useToast } from "../components/Toast";
@@ -39,7 +39,6 @@ type AccountData = {
     plan_name: string | null;
     plan_code: string | null;
     billingStartDate: string | null;
-    tuitionDueDay: number | null;
   };
   progress: {
     totalCredits: number;
@@ -51,24 +50,22 @@ type AccountData = {
     summary: {
       tuitionAmount: number;
       expectedPayments: number;
-      totalInstallments: number;
-      accruedInstallments: number;
       expectedAmount: number;
-      accruedAmount: number;
       paidAmount: number;
       balance: number;
       paidInstallments: number;
       pendingInstallments: number;
     };
     payments: Payment[];
+    schedule: Array<{
+      period: number;
+      dueDate: string | null;
+      expectedAmount: number;
+      paidAmount: number;
+      pendingAmount: number;
+      status: "paid" | "partial" | "pending";
+    }>;
   };
-};
-
-type PaymentPreview = {
-  previewId: string;
-  summary: { total: number; valid: number; errors: number; existing: number };
-  rows: Array<{ row: number; studentNumber: string; studentName: string; folio: string; amount: number; paidAt: string }>;
-  errors: Array<{ row: number; message: string }>;
 };
 
 type Overview = {
@@ -104,15 +101,9 @@ export function PaymentsPage() {
   const [reportMonth, setReportMonth] = useState(month);
   const [reportGroupId, setReportGroupId] = useState("");
   const [open, setOpen] = useState(false);
-  const [importOpen, setImportOpen] = useState(false);
-  const [preview, setPreview] = useState<PaymentPreview | null>(null);
-  const [existingMode, setExistingMode] = useState<"ignore" | "update">("update");
   const [editing, setEditing] = useState<Payment | null>(null);
   const [form, setForm] = useState(emptyForm);
-  const [billingStartDate, setBillingStartDate] = useState(today);
-  const [billingDueDate, setBillingDueDate] = useState(today.slice(0, 8) + "10");
   const [busy, setBusy] = useState(false);
-  const fileRef = useRef<HTMLInputElement>(null);
 
   async function searchStudents(query = search) {
     const result = await api<{ records: StudentResult[] }>(`/payments/students?search=${encodeURIComponent(query)}`);
@@ -209,59 +200,6 @@ export function PaymentsPage() {
     }
   }
 
-  async function applyGroupBillingConfig() {
-    if (!reportGroupId) return toast.error("Selecciona el grupo al que aplicaras el cobro.");
-    setBusy(true);
-    try {
-      const dueDay = Number(billingDueDate.slice(8, 10));
-      const result = await api<{ count: number }>("/payments/billing-config/group", {
-        method: "POST",
-        body: { groupId: reportGroupId, startDate: billingStartDate, dueDay }
-      });
-      toast.success(`Configuracion aplicada a ${result.count} alumnos activos.`);
-      if (account) await loadAccount(account.student.studentId);
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "No fue posible configurar el cobro.");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function previewPaymentsImport(file: File) {
-    const body = new FormData();
-    body.append("file", file);
-    setBusy(true);
-    try {
-      setPreview(await api<PaymentPreview>("/payments/import/preview", { method: "POST", body }));
-      setImportOpen(true);
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "No fue posible leer el archivo.");
-    } finally {
-      setBusy(false);
-      if (fileRef.current) fileRef.current.value = "";
-    }
-  }
-
-  async function applyPaymentsImport() {
-    if (!preview) return;
-    setBusy(true);
-    try {
-      const result = await api<{ created: number; updated: number; ignored: number }>("/payments/import/apply", {
-        method: "POST",
-        body: { previewId: preview.previewId, existingMode }
-      });
-      toast.success(`Pagos importados: ${result.created} nuevos, ${result.updated} actualizados.`);
-      setImportOpen(false);
-      setPreview(null);
-      if (account) await loadAccount(account.student.studentId);
-      await loadOverview();
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "No fue posible importar los pagos.");
-    } finally {
-      setBusy(false);
-    }
-  }
-
   const reportQuery = useMemo(() => {
     const params = new URLSearchParams({ month: reportMonth });
     if (reportGroupId) params.set("groupId", reportGroupId);
@@ -282,14 +220,8 @@ export function PaymentsPage() {
         <div className="toolbar-actions">
           <Field label="Mes"><input type="month" value={reportMonth} onChange={(event) => setReportMonth(event.target.value || month)} /></Field>
           <Field label="Grupo"><Select value={reportGroupId} onChange={(event) => setReportGroupId(event.target.value)} options={groups} placeholder="Todos" /></Field>
-          <Field label="Inicio cobro"><input type="date" value={billingStartDate} onChange={(event) => setBillingStartDate(event.target.value || today)} /></Field>
-          <Field label="Dia de cargo"><input type="date" value={billingDueDate} onChange={(event) => setBillingDueDate(event.target.value || today)} /></Field>
-          {can("payments.manage") && <Button type="button" variant="secondary" icon={<CalendarDays size={17} />} busy={busy} onClick={applyGroupBillingConfig}>Aplicar cobro al grupo</Button>}
           <Button type="button" variant="secondary" icon={<Download size={17} />} onClick={() => openDocument(`/payments/report?${reportQuery}&format=pdf`)}>Estado de cuenta</Button>
           <Button type="button" variant="secondary" icon={<FileSpreadsheet size={17} />} onClick={() => download(`/payments/report?${reportQuery}&format=xlsx`, `estado-de-cuenta-${reportMonth}.xlsx`)}>Excel</Button>
-          {can("payments.manage") && <Button type="button" variant="secondary" icon={<FileSpreadsheet size={17} />} onClick={() => download("/payments/template/import.xlsx", "plantilla-pagos.xlsx")}>Formato pagos</Button>}
-          {can("payments.manage") && <Button type="button" variant="secondary" icon={<Upload size={17} />} onClick={() => fileRef.current?.click()}>Importar pagos</Button>}
-          <input ref={fileRef} hidden type="file" accept=".xlsx,.xls,.csv" onChange={(event) => event.target.files?.[0] && previewPaymentsImport(event.target.files[0])} />
         </div>
       </section>
 
@@ -314,7 +246,7 @@ export function PaymentsPage() {
       {account ? (
         <>
           <section className="payment-account-header">
-            <div><span>{account.student.program_name} | {account.student.cycle_name}</span><h2>{account.student.student_name}</h2><p>{account.student.student_number} | Grupo {account.student.group_name} | {account.student.plan_name ?? "Sin plan academico"} | Inicio cobro {account.student.billingStartDate ?? "Sin fecha"} | Dia {account.student.tuitionDueDay ?? 10}</p></div>
+            <div><span>{account.student.program_name} | {account.student.cycle_name}</span><h2>{account.student.student_name}</h2><p>{account.student.student_number} | Grupo {account.student.group_name} | {account.student.plan_name ?? "Sin plan academico"} | Inicio cobro {account.student.billingStartDate ?? "Sin fecha"}</p></div>
             <div className="payment-account-actions">
               <Button type="button" variant="secondary" icon={<Download size={17} />} onClick={() => openDocument(`/payments/student/${account.student.studentId}/statement?format=pdf`)}>Estado de cuenta</Button>
               {can("payments.manage") && <Button type="button" icon={<Plus size={17} />} onClick={openCreate}>Nuevo pago</Button>}
@@ -322,7 +254,7 @@ export function PaymentsPage() {
           </section>
 
           <section className="payment-metrics">
-            <div><CalendarDays size={21} /><span>Colegiaturas</span><strong>{summary?.paidInstallments}<small> / {summary?.accruedInstallments}</small></strong><small>Total plan {summary?.totalInstallments}</small></div>
+            <div><CalendarDays size={21} /><span>Colegiaturas</span><strong>{summary?.paidInstallments}<small> / {summary?.expectedPayments}</small></strong></div>
             <div><Banknote size={21} /><span>Pagado</span><strong>{money(summary?.paidAmount)}</strong></div>
             <div><WalletCards size={21} /><span>Adeudo</span><strong>{money(summary?.balance)}</strong></div>
             <div><ReceiptText size={21} /><span>Avance curricular</span><strong>{account.progress.percentage}%</strong></div>
@@ -342,6 +274,7 @@ export function PaymentsPage() {
             </tbody></table></div>
             {!account.billing.payments.length && <EmptyState icon={<ReceiptText size={25} />} title="Sin pagos registrados" text="Aun no hay cobros vinculados a este alumno." />}
           </section>
+
         </>
       ) : (
         <EmptyState icon={<WalletCards size={28} />} title="Selecciona un alumno" text="Busca por matricula o nombre para abrir su estado de cuenta." />
@@ -359,31 +292,6 @@ export function PaymentsPage() {
           <Field label="Notas"><textarea value={form.notes} onChange={(event) => setForm({ ...form, notes: event.target.value })} /></Field>
           <div className="modal-actions"><Button type="button" variant="ghost" onClick={() => setOpen(false)}>Cancelar</Button><Button type="submit" busy={busy}>{editing ? "Guardar cambios" : "Registrar pago"}</Button></div>
         </form>
-      </Modal>
-
-      <Modal open={importOpen} onClose={() => setImportOpen(false)} title="Importar pagos" size="large">
-        {!preview ? (
-          <div className="import-step">
-            <div className="drop-zone" onClick={() => fileRef.current?.click()}>
-              <FileSpreadsheet size={36} /><strong>Selecciona un archivo Excel o CSV</strong><span>Usa el formato de pagos para evitar errores de captura</span>
-            </div>
-          </div>
-        ) : (
-          <div className="preview-step">
-            <div className="import-summary">
-              <div><span>Filas</span><strong>{preview.summary.total}</strong></div>
-              <div className="summary-valid"><span>Validas</span><strong>{preview.summary.valid}</strong></div>
-              <div className="summary-error"><span>Con error</span><strong>{preview.summary.errors}</strong></div>
-              <div><span>Existentes</span><strong>{preview.summary.existing}</strong></div>
-            </div>
-            {preview.errors.length > 0 && <div className="error-list">{preview.errors.slice(0, 6).map((error) => <p key={`${error.row}-${error.message}`}><b>Fila {error.row}</b>{error.message}</p>)}</div>}
-            <div className="segmented"><button className={existingMode === "ignore" ? "active" : ""} onClick={() => setExistingMode("ignore")}>Ignorar existentes</button><button className={existingMode === "update" ? "active" : ""} onClick={() => setExistingMode("update")}>Actualizar existentes</button></div>
-            <div className="mini-preview-table"><table><thead><tr><th>Fila</th><th>Matricula</th><th>Alumno</th><th>Folio</th><th>Fecha</th><th>Monto</th></tr></thead><tbody>
-              {preview.rows.slice(0, 8).map((row) => <tr key={row.row}><td>{row.row}</td><td>{row.studentNumber}</td><td>{row.studentName}</td><td>{row.folio}</td><td>{row.paidAt}</td><td><strong>{money(row.amount)}</strong></td></tr>)}
-            </tbody></table></div>
-            <div className="modal-actions"><Button variant="ghost" onClick={() => setPreview(null)}>Elegir otro archivo</Button><Button busy={busy} onClick={applyPaymentsImport} disabled={!preview.summary.valid}>Confirmar importacion</Button></div>
-          </div>
-        )}
       </Modal>
     </div>
   );
